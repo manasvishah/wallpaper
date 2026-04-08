@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Live Pattern Wallpaper</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f7f4ee;
+      touch-action: none;
+    }
+    body {
+      position: fixed;
+      inset: 0;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: #f7f4ee;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    let port = null;
+    let reader = null;
+    let inputDone = null;
+    let keepReading = false;
+
+    let mood = 0;
+    let sound = 0;
+    let light = 0;
+    let bpm = 0;
+    let beat = 0;
+
+    let smoothSound = 0;
+    let smoothBpm = 0;
+    let currentTimestamp = new Date();
+
+    const SOUND_THRESHOLD = 18;
+    const ACTIVE_THRESHOLD = 24;
+
+    let SAFE_LEFT = 40;
+    let SAFE_RIGHT = 40;
+    let SAFE_TOP = 40;
+    let SAFE_BOTTOM = 40;
+
+    const GRID_COLS = 6;
+    const GRID_ROWS = 4;
+    const TILE_GAP = 0;
+
+    let portraitStarted = false;
+    let availableTiles = [];
+    let finishedShapes = [];
+    let activeShape = null;
+    let beatAccumulator = 0;
+    let stableEnergyFrames = 0;
+    let placedTypes = new Map();
+    let shapeCounts = {};
+    let placedColorInfo = new Map();
+
+    function resizeCanvas() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      SAFE_LEFT = Math.max(24, w * 0.03);
+      SAFE_RIGHT = Math.max(24, w * 0.03);
+      SAFE_TOP = Math.max(24, h * 0.03);
+      SAFE_BOTTOM = Math.max(24, h * 0.03);
+
+      renderComposition();
+    }
+
+    function getPalette() {
+      const allColors = [
+        "#f4cc1b", "#ffffff", "#223c88", "#ea4fc0", "#e84e40", "#29bb63", "#6a3fe6", "#a8c7e3",
+        "#ff7a1f", "#1f6ae5", "#ff5ca8", "#c5ef4d", "#ff9db7", "#7d5cff", "#00b894", "#f6d365",
+        "#ef476f", "#118ab2", "#8d99ae", "#06d6a0", "#ffd166", "#8338ec", "#fb5607", "#3a86ff",
+        "#43aa8b", "#f72585", "#90be6d", "#577590", "#f3722c", "#b5179e"
+      ];
+      return { bg: "#f7f4ee", colors: allColors };
+    }
+
+    function setBackground() {
+      ctx.fillStyle = getPalette(mood).bg;
+      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+    }
+
+    function clearPattern() {
+      portraitStarted = false;
+      availableTiles = [];
+      finishedShapes = [];
+      activeShape = null;
+      beatAccumulator = 0;
+      stableEnergyFrames = 0;
+      placedTypes = new Map();
+      shapeCounts = {};
+      placedColorInfo = new Map();
+      currentTimestamp = new Date();
+      renderComposition();
+    }
+
+    function makeTiles() {
+      const innerW = window.innerWidth - SAFE_LEFT - SAFE_RIGHT;
+      const innerH = window.innerHeight - SAFE_TOP - SAFE_BOTTOM;
+      const tileW = (innerW - TILE_GAP * (GRID_COLS - 1)) / GRID_COLS;
+      const tileH = (innerH - TILE_GAP * (GRID_ROWS - 1)) / GRID_ROWS;
+
+      const tiles = [];
+      for (let r = 0; r < GRID_ROWS; r++) {
+        for (let c = 0; c < GRID_COLS; c++) {
+          tiles.push({
+            x: SAFE_LEFT + c * (tileW + TILE_GAP),
+            y: SAFE_TOP + r * (tileH + TILE_GAP),
+            w: tileW,
+            h: tileH,
+            row: r,
+            col: c,
+            key: `${r}-${c}`
+          });
+        }
+      }
+
+      for (let i = tiles.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [tiles[i], tiles[j]] = [tiles[j], tiles[i]];
+      }
+      return tiles;
+    }
+
+    function randomFrom(arr) {
+      return arr[Math.floor(Math.random() * arr.length)];
+    }
+
+    function weightedTypePool() {
+      return [
+        "circle", "rings", "diamond", "arc", "triangles", "bars", "square-in-square",
+        "quarter-circle", "half-circle", "double-arch", "clover", "starburst",
+        "capsule", "split-diagonal", "target", "line-grid", "line-stack"
+      ];
+    }
+
+    function getNeighborKeys(tile, includeDiagonal = false) {
+      const keys = [
+        `${tile.row - 1}-${tile.col}`,
+        `${tile.row + 1}-${tile.col}`,
+        `${tile.row}-${tile.col - 1}`,
+        `${tile.row}-${tile.col + 1}`
+      ];
+      if (includeDiagonal) {
+        keys.push(
+          `${tile.row - 1}-${tile.col - 1}`,
+          `${tile.row - 1}-${tile.col + 1}`,
+          `${tile.row + 1}-${tile.col - 1}`,
+          `${tile.row + 1}-${tile.col + 1}`
+        );
+      }
+      return keys;
+    }
+
+    function getNeighborTypes(tile) {
+      return getNeighborKeys(tile, false).map(k => placedTypes.get(k)).filter(Boolean);
+    }
+
+    function chooseTypeForTile(tile) {
+      const pool = weightedTypePool();
+      const neighbors = getNeighborTypes(tile);
+
+      let candidates = pool.filter(type => {
+        const count = shapeCounts[type] || 0;
+        return count < 2 && !neighbors.includes(type);
+      });
+
+      if (!candidates.length) candidates = pool.filter(type => !neighbors.includes(type));
+      if (!candidates.length) candidates = pool;
+      return randomFrom(candidates);
+    }
+
+    function getNeighborUsedColors(tile) {
+      const keys = getNeighborKeys(tile, true);
+      const used = new Set();
+
+      keys.forEach(k => {
+        const info = placedColorInfo.get(k);
+        if (!info) return;
+        if (info.baseColor) used.add(info.baseColor);
+        if (info.primaryColor) used.add(info.primaryColor);
+      });
+
+      return used;
+    }
+
+    function pickColorNotNear(tile, palette, forbidden = new Set()) {
+      const usedNearby = getNeighborUsedColors(tile);
+      let candidates = palette.filter(c => !usedNearby.has(c) && !forbidden.has(c));
+      if (!candidates.length) candidates = palette.filter(c => !forbidden.has(c));
+      if (!candidates.length) candidates = palette;
+      return randomFrom(candidates);
+    }
+
+    function solidRect(x, y, w, h, color, alpha = 0.98) {
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.globalAlpha = alpha;
+      ctx.fillRect(x, y, w, h);
+      ctx.restore();
+    }
+
+    function solidCircle(x, y, r, color, alpha = 0.98) {
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.globalAlpha = alpha;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function rectBase(shape) {
+      const { tile, baseColor, outerProgress } = shape;
+      solidRect(tile.x, tile.y, tile.w * outerProgress, tile.h, baseColor);
+    }
+
+    function createShapeForTile(tile) {
+      const palette = [...getPalette(mood).colors];
+      const type = chooseTypeForTile(tile);
+
+      const forbidden = new Set();
+      const baseColor = pickColorNotNear(tile, palette, forbidden);
+      forbidden.add(baseColor);
+
+      const primaryColor = pickColorNotNear(tile, palette, forbidden);
+      forbidden.add(primaryColor);
+
+      const secondaryColor = pickColorNotNear(tile, palette, forbidden);
+      forbidden.add(secondaryColor);
+
+      const tertiaryColor = pickColorNotNear(tile, palette, forbidden);
+      forbidden.add(tertiaryColor);
+
+      const quaternaryColor = pickColorNotNear(tile, palette, forbidden);
+
+      return {
+        tile,
+        type,
+        baseColor,
+        primaryColor,
+        colors: [primaryColor, secondaryColor, tertiaryColor, quaternaryColor],
+        outerProgress: 0,
+        innerProgress: 0
+      };
+    }
+
+    function drawCircle(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c] = shape.colors;
+      const p = shape.innerProgress;
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+
+      solidCircle(cx, cy, Math.min(w, h) * 0.24 * p, a);
+      if (p > 0.25) solidCircle(cx, cy, Math.min(w, h) * 0.14 * p, b);
+      if (p > 0.55) solidCircle(cx, cy, Math.min(w, h) * 0.06 * p, c);
+    }
+
+    function drawRings(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c] = shape.colors;
+      const p = shape.innerProgress;
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+
+      solidCircle(cx, cy, Math.min(w, h) * 0.26 * p, a);
+      if (p > 0.2) solidCircle(cx, cy, Math.min(w, h) * 0.18 * p, shape.baseColor);
+      if (p > 0.35) solidCircle(cx, cy, Math.min(w, h) * 0.12 * p, b);
+      if (p > 0.6) solidCircle(cx, cy, Math.min(w, h) * 0.05 * p, c);
+    }
+
+    function drawDiamond(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c] = shape.colors;
+      const p = shape.innerProgress;
+
+      ctx.save();
+      ctx.translate(x + w / 2, y + h / 2);
+      ctx.rotate(Math.PI / 4);
+      solidRect(-w * 0.20 * p, -h * 0.20 * p, w * 0.40 * p, h * 0.40 * p, a);
+      if (p > 0.3) solidRect(-w * 0.10 * p, -h * 0.10 * p, w * 0.20 * p, h * 0.20 * p, b);
+      if (p > 0.55) solidRect(-w * 0.04 * p, -h * 0.04 * p, w * 0.08 * p, h * 0.08 * p, c);
+      ctx.restore();
+    }
+
+    function drawArc(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b] = shape.colors;
+      const p = shape.innerProgress;
+      const cx = x + w / 2;
+      const cy = y + h * 0.80;
+      const r = Math.min(w, h) * 0.28;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * p, Math.PI, 0);
+      ctx.lineTo(cx + r * p, cy);
+      ctx.lineTo(cx - r * p, cy);
+      ctx.closePath();
+      ctx.fillStyle = a;
+      ctx.fill();
+      ctx.restore();
+
+      if (p > 0.5) solidCircle(cx, cy - h * 0.14, Math.min(w, h) * 0.05 * p, b);
+    }
+
+    function drawTriangles(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b] = shape.colors;
+      const p = shape.innerProgress;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(x + w * 0.08, y + h * 0.08);
+      ctx.lineTo(x + w * 0.92 * p, y + h * 0.08);
+      ctx.lineTo(x + w * 0.08, y + h * 0.92 * p);
+      ctx.closePath();
+      ctx.fillStyle = a;
+      ctx.fill();
+      ctx.restore();
+
+      if (p > 0.35) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(x + w * 0.92, y + h * 0.92);
+        ctx.lineTo(x + w * (1 - 0.84 * p), y + h * 0.92);
+        ctx.lineTo(x + w * 0.92, y + h * (1 - 0.84 * p));
+        ctx.closePath();
+        ctx.fillStyle = b;
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    function drawBars(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c, d] = shape.colors;
+      const p = shape.innerProgress;
+
+      solidRect(x + w * 0.08, y + h * 0.08, w * 0.14 * p, h * 0.84, a);
+      if (p > 0.2) solidRect(x + w * 0.30, y + h * 0.08, w * 0.14 * p, h * 0.84, b);
+      if (p > 0.4) solidRect(x + w * 0.52, y + h * 0.08, w * 0.14 * p, h * 0.84, c);
+      if (p > 0.6) solidRect(x + w * 0.74, y + h * 0.08, w * 0.14 * p, h * 0.84, d);
+    }
+
+    function drawSquareInSquare(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c] = shape.colors;
+      const p = shape.innerProgress;
+
+      solidRect(x + w * 0.12, y + h * 0.12, w * 0.76 * p, h * 0.76 * p, a);
+      if (p > 0.25) solidRect(x + w * 0.28, y + h * 0.28, w * 0.44 * p, h * 0.44 * p, b);
+      if (p > 0.55) solidRect(x + w * 0.42, y + h * 0.42, w * 0.16 * p, h * 0.16 * p, c);
+    }
+
+    function drawQuarterCircle(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b] = shape.colors;
+      const p = shape.innerProgress;
+      const r = Math.min(w, h) * 0.82 * p;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(x, y + h);
+      ctx.arc(x, y + h, r, -Math.PI / 2, 0);
+      ctx.closePath();
+      ctx.fillStyle = a;
+      ctx.fill();
+      ctx.restore();
+
+      if (p > 0.45) solidCircle(x + w * 0.18, y + h * 0.76, Math.min(w, h) * 0.05 * p, b);
+    }
+
+    function drawHalfCircle(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b] = shape.colors;
+      const p = shape.innerProgress;
+      const cx = x + w / 2;
+      const cy = y + h;
+      const r = Math.min(w, h) * 0.34 * p;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, Math.PI, 0);
+      ctx.lineTo(cx + r, cy);
+      ctx.lineTo(cx - r, cy);
+      ctx.closePath();
+      ctx.fillStyle = a;
+      ctx.fill();
+      ctx.restore();
+
+      if (p > 0.45) solidCircle(cx, cy - h * 0.12, Math.min(w, h) * 0.05 * p, b);
+    }
+
+    function drawDoubleArch(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c] = shape.colors;
+      const p = shape.innerProgress;
+      const archW = w * 0.26;
+      const archH = h * 0.44 * p;
+
+      solidRect(x + w * 0.12, y + h - archH - h * 0.10, archW, archH, a);
+      solidRect(x + w * 0.62, y + h - archH - h * 0.10, archW, archH, b);
+
+      ctx.save();
+      ctx.fillStyle = shape.baseColor;
+      ctx.beginPath();
+      ctx.arc(x + w * 0.12 + archW / 2, y + h - archH - h * 0.10, archW * 0.24, Math.PI, 0);
+      ctx.arc(x + w * 0.62 + archW / 2, y + h - archH - h * 0.10, archW * 0.24, Math.PI, 0);
+      ctx.fill();
+      ctx.restore();
+
+      if (p > 0.55) solidRect(x + w * 0.44, y + h * 0.62, w * 0.12 * p, h * 0.12 * p, c);
+    }
+
+    function drawClover(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c] = shape.colors;
+      const p = shape.innerProgress;
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+      const r = Math.min(w, h) * 0.11 * p;
+
+      solidCircle(cx - r, cy - r, r, a);
+      solidCircle(cx + r, cy - r, r, a);
+      solidCircle(cx - r, cy + r, r, a);
+      solidCircle(cx + r, cy + r, r, a);
+
+      if (p > 0.45) solidCircle(cx, cy, r * 0.72, b);
+      if (p > 0.7) solidCircle(cx, cy, r * 0.24, c);
+    }
+
+    function drawStarburst(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b] = shape.colors;
+      const p = shape.innerProgress;
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+      const outer = Math.min(w, h) * 0.22 * p;
+      const inner = outer * 0.45;
+
+      ctx.save();
+      ctx.beginPath();
+      for (let i = 0; i < 16; i++) {
+        const angle = (Math.PI * 2 * i) / 16;
+        const r = i % 2 === 0 ? outer : inner;
+        const px = cx + Math.cos(angle) * r;
+        const py = cy + Math.sin(angle) * r;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fillStyle = a;
+      ctx.fill();
+      ctx.restore();
+
+      if (p > 0.55) solidCircle(cx, cy, inner * 0.55, b);
+    }
+
+    function drawCapsule(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c] = shape.colors;
+      const p = shape.innerProgress;
+      const capW = w * 0.24;
+      const capH = h * 0.48 * p;
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+
+      ctx.save();
+      ctx.fillStyle = a;
+      ctx.beginPath();
+      ctx.roundRect(cx - capW / 2, cy - capH / 2, capW, capH, capW / 2);
+      ctx.fill();
+      ctx.restore();
+
+      if (p > 0.45) solidCircle(cx, cy, Math.min(w, h) * 0.07 * p, b);
+      if (p > 0.7) solidCircle(cx, cy, Math.min(w, h) * 0.03 * p, c);
+    }
+
+    function drawSplitDiagonal(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c] = shape.colors;
+      const p = shape.innerProgress;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(x + w * 0.08, y + h * 0.08);
+      ctx.lineTo(x + w * 0.92, y + h * 0.08);
+      ctx.lineTo(x + w * 0.08, y + h * 0.92);
+      ctx.closePath();
+      ctx.fillStyle = a;
+      ctx.fill();
+      ctx.restore();
+
+      if (p > 0.2) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(x + w * 0.92, y + h * 0.92);
+        ctx.lineTo(x + w * 0.92, y + h * 0.08);
+        ctx.lineTo(x + w * 0.08, y + h * 0.92);
+        ctx.closePath();
+        ctx.fillStyle = b;
+        ctx.globalAlpha = p;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      if (p > 0.6) solidCircle(x + w * 0.18, y + h * 0.18, Math.min(w, h) * 0.04 * p, c);
+    }
+
+    function drawTarget(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c, d] = shape.colors;
+      const p = shape.innerProgress;
+      const cx = x + w / 2;
+      const cy = y + h / 2;
+      const r = Math.min(w, h) * 0.22 * p;
+
+      solidCircle(cx, cy, r, a);
+      if (p > 0.2) solidCircle(cx, cy, r * 0.72, b);
+      if (p > 0.45) solidCircle(cx, cy, r * 0.42, c);
+      if (p > 0.7) solidCircle(cx, cy, r * 0.16, d);
+    }
+
+    function drawLineGrid(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b, c] = shape.colors;
+      const p = shape.innerProgress;
+
+      const count = 5;
+      for (let i = 0; i < count; i++) {
+        const yy = y + h * (0.18 + i * 0.14);
+        solidRect(x + w * 0.16, yy, w * 0.68 * p, h * 0.035, i % 2 === 0 ? a : b);
+      }
+      if (p > 0.55) {
+        solidRect(x + w * 0.46, y + h * 0.18, w * 0.03, h * 0.56 * p, c);
+      }
+    }
+
+    function drawLineStack(shape) {
+      const { x, y, w, h } = shape.tile;
+      const [a, b] = shape.colors;
+      const p = shape.innerProgress;
+
+      for (let i = 0; i < 4; i++) {
+        const xx = x + w * (0.18 + i * 0.16);
+        solidRect(xx, y + h * 0.16, w * 0.05, h * 0.68 * p, i % 2 === 0 ? a : b);
+      }
+    }
+
+    function drawShape(shape) {
+      rectBase(shape);
+      if (shape.type === "circle") drawCircle(shape);
+      if (shape.type === "rings") drawRings(shape);
+      if (shape.type === "diamond") drawDiamond(shape);
+      if (shape.type === "arc") drawArc(shape);
+      if (shape.type === "triangles") drawTriangles(shape);
+      if (shape.type === "bars") drawBars(shape);
+      if (shape.type === "square-in-square") drawSquareInSquare(shape);
+      if (shape.type === "quarter-circle") drawQuarterCircle(shape);
+      if (shape.type === "half-circle") drawHalfCircle(shape);
+      if (shape.type === "double-arch") drawDoubleArch(shape);
+      if (shape.type === "clover") drawClover(shape);
+      if (shape.type === "starburst") drawStarburst(shape);
+      if (shape.type === "capsule") drawCapsule(shape);
+      if (shape.type === "split-diagonal") drawSplitDiagonal(shape);
+      if (shape.type === "target") drawTarget(shape);
+      if (shape.type === "line-grid") drawLineGrid(shape);
+      if (shape.type === "line-stack") drawLineStack(shape);
+    }
+
+    function renderComposition() {
+      setBackground();
+      for (const shape of finishedShapes) drawShape(shape);
+      if (activeShape) drawShape(activeShape);
+    }
+
+    function maybeStartPortrait() {
+      const energy = Math.max(0, smoothSound - SOUND_THRESHOLD);
+      if (energy >= ACTIVE_THRESHOLD) stableEnergyFrames++;
+      else stableEnergyFrames = 0;
+
+      if (!portraitStarted && stableEnergyFrames > 6) {
+        portraitStarted = true;
+        currentTimestamp = new Date();
+        availableTiles = makeTiles();
+      }
+    }
+
+    function maybeSpawnShape() {
+      if (!portraitStarted || activeShape || availableTiles.length === 0) return;
+
+      const energy = Math.max(0, smoothSound - SOUND_THRESHOLD);
+      const passiveChance = energy > ACTIVE_THRESHOLD ? 0.0008 + smoothBpm / 60000 : 0;
+
+      if (beatAccumulator > 0 || Math.random() < passiveChance) {
+        const tile = availableTiles.shift();
+        activeShape = createShapeForTile(tile);
+        beatAccumulator = Math.max(0, beatAccumulator - 1);
+      }
+    }
+
+    function stepActiveShape() {
+      if (!activeShape) return;
+
+      const outerSpeed = 0.0018 + Math.max(0, smoothBpm) / 50000;
+      const innerSpeed = 0.0012 + Math.max(0, smoothBpm) / 70000;
+
+      activeShape.outerProgress = Math.min(1, activeShape.outerProgress + outerSpeed);
+
+      if (activeShape.outerProgress > 0.82) {
+        activeShape.innerProgress = Math.min(1, activeShape.innerProgress + innerSpeed);
+      }
+
+      if (activeShape.outerProgress >= 1 && activeShape.innerProgress >= 1) {
+        finishedShapes.push(activeShape);
+        placedTypes.set(activeShape.tile.key, activeShape.type);
+        placedColorInfo.set(activeShape.tile.key, {
+          baseColor: activeShape.baseColor,
+          primaryColor: activeShape.primaryColor
+        });
+        shapeCounts[activeShape.type] = (shapeCounts[activeShape.type] || 0) + 1;
+        activeShape = null;
+      }
+    }
+
+    function animate() {
+      smoothSound += (sound - smoothSound) * 0.12;
+      smoothBpm += (bpm - smoothBpm) * 0.06;
+
+      if (beat === 1) {
+        beatAccumulator++;
+        beat = 0;
+      }
+
+      maybeStartPortrait();
+      maybeSpawnShape();
+      stepActiveShape();
+      renderComposition();
+
+      requestAnimationFrame(animate);
+    }
+
+    function parseLine(line) {
+      if (!line.startsWith("DATA:")) return;
+
+      const parts = line.replace("DATA:", "").split(",");
+
+      if (parts.length >= 3) {
+        mood = parseInt(parts[0]) || 0;
+        sound = parseInt(parts[1]) || 0;
+        light = parseInt(parts[2]) || 0;
+      }
+
+      if (parts.length >= 5) {
+        bpm = parseInt(parts[3]) || 0;
+        beat = parseInt(parts[4]) || 0;
+      } else {
+        bpm = 0;
+        beat = 0;
+      }
+    }
+
+    async function connectSerial() {
+      if (!("serial" in navigator)) return;
+      try {
+        if (port) await disconnectPort();
+
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        const decoder = new TextDecoderStream();
+        inputDone = port.readable.pipeTo(decoder.writable);
+        reader = decoder.readable.getReader();
+
+        keepReading = true;
+        let buffer = "";
+
+        while (keepReading) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+
+          buffer += value;
+          const lines = buffer.split("\n");
+          buffer = lines.pop();
+
+          for (const line of lines) parseLine(line.trim());
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function disconnectPort() {
+      keepReading = false;
+
+      try {
+        if (reader) {
+          await reader.cancel();
+          reader.releaseLock();
+          reader = null;
+        }
+      } catch (e) {}
+
+      try {
+        if (inputDone) {
+          await inputDone.catch(() => {});
+          inputDone = null;
+        }
+      } catch (e) {}
+
+      try {
+        if (port) {
+          await port.close();
+          port = null;
+        }
+      } catch (e) {}
+    }
+
+    window.addEventListener("resize", resizeCanvas);
+    window.addEventListener("keydown", (e) => {
+      if (e.key.toLowerCase() === "c") clearPattern();
+      if (e.key.toLowerCase() === "r") location.reload();
+      if (e.key === " " || e.key === "Enter") connectSerial();
+    });
+
+    canvas.addEventListener("pointerdown", () => {
+      if (!port) connectSerial();
+    });
+
+    resizeCanvas();
+    clearPattern();
+    animate();
+  </script>
+</body>
+</html>
